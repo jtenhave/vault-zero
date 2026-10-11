@@ -2,6 +2,9 @@ package vaultzero
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,10 +13,16 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
+	"github.com/google/uuid"
 	vzaws "github.com/jtenhave/vaultzero/aws"
 )
 
 const manifestFileName = "manifest.json"
+const globalMetadataFileName = "global_metadata.json"
+
+type GlobalMetadataFileData struct {
+	MachineID string `json:"machine_id"`
+}
 
 type ArchiveFileData struct {
 	ID string `json:"id"`
@@ -37,14 +46,14 @@ func Init(ctx context.Context, args []string) error {
 
 	fmt.Println("✅ Root folder validated.")
 
-	_, err = ensureConfigDir()
+	_, machineID, err := ensureDataDir()
 	if err != nil {
 		return err
 	}
 
-	userId := ""
+	var awsAccessKey string
 	for {
-		accessKey, isValid := promptForAccessKey()
+		awsAccessKey, isValid = promptForAccessKey()
 		if !isValid {
 			continue
 		}
@@ -54,7 +63,7 @@ func Init(ctx context.Context, args []string) error {
 			continue
 		}
 
-		userId, isValid, err = validateAWSCredentials(ctx, accessKey, secretAccessKey)
+		_, isValid, err = validateAWSCredentials(ctx, awsAccessKey, secretAccessKey)
 		if err != nil {
 			return err
 		}
@@ -68,7 +77,9 @@ func Init(ctx context.Context, args []string) error {
 
 	fmt.Println("✅ AWS credentials validated.")
 
-	fmt.Println("User ID: ", userId)
+	archiveID := getArchiveID(rootFolder, awsAccessKey, machineID)
+
+	fmt.Println("Archive ID: ", archiveID)
 
 	fmt.Println("Initializing vault-zero in: ", rootFolder)
 	rollbacks := []func() error{}
@@ -80,6 +91,12 @@ func Init(ctx context.Context, args []string) error {
 			}
 		}
 	}()
+
+	/*archiveFile, err := createArchiveFile(rootFolder, awsAccessKey, machineID)
+	if err != nil {
+		return err
+	}
+	rollbacks = append(rollbacks, archiveFile)*/
 
 	return nil
 }
@@ -117,26 +134,65 @@ func validateNoArchiveFile(rootFolder string) (string, bool, error) {
 	return archiveFile, true, nil
 }
 
-func ensureConfigDir() (string, error) {
+func ensureDataDir() (string, string, error) {
 	userConfigDir, err := os.UserConfigDir()
 	if err != nil {
-		return "", fmt.Errorf("failed to get user config dir: %s", err)
+		return "", "", fmt.Errorf("failed to get user config dir: %s", err)
 	}
 
-	configDirPath := fmt.Sprintf("%s\\%s", userConfigDir, configDir)
-	_, err = os.Stat(configDirPath)
+	dataDirPath := fmt.Sprintf("%s\\%s", userConfigDir, dataDir)
+
+	_, err = os.Stat(dataDirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			err = os.MkdirAll(configDirPath, 0755)
+			err = os.MkdirAll(dataDirPath, 0755)
 			if err != nil {
-				return "", fmt.Errorf("failed to create config dir: %s", err)
+				return "", "", fmt.Errorf("failed to create data dir: %s", err)
 			}
 		} else {
-			return "", fmt.Errorf("cannot stat config dir: %s", configDirPath)
+			return "", "", fmt.Errorf("cannot stat data dir: %s", dataDirPath)
 		}
 	}
 
-	return configDirPath, nil
+	machineID := ""
+	globalMetadataFilePath := fmt.Sprintf("%s\\%s", dataDirPath, globalMetadataFileName)
+
+	globalMetadataFileRaw, err := os.ReadFile(globalMetadataFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			machineIDGuid, err := uuid.NewRandom()
+			if err != nil {
+				return "", "", fmt.Errorf("failed to generate machine ID: %s", err)
+			}
+
+			machineID = machineIDGuid.String()
+			globalMetadataFileData := GlobalMetadataFileData{
+				MachineID: machineID,
+			}
+
+			globalMetadataFileRaw, err := json.Marshal(globalMetadataFileData)
+			if err != nil {
+				return "", "", fmt.Errorf("error marshaling metadata file to JSON: %s", err)
+			}
+
+			err = os.WriteFile(globalMetadataFilePath, globalMetadataFileRaw, 0644)
+			if err != nil {
+				return "", "", fmt.Errorf("failed to write metadata file to root folder: %s", err)
+			}
+
+			return dataDirPath, machineID, nil
+		}
+
+		return "", "", fmt.Errorf("cannot read global metadata file: %s", globalMetadataFilePath)
+	} else {
+		globalMetadataFileData := GlobalMetadataFileData{}
+		err = json.Unmarshal(globalMetadataFileRaw, &globalMetadataFileData)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to unmarshal global metadata file: %s", err)
+		}
+
+		return dataDirPath, globalMetadataFileData.MachineID, nil
+	}
 }
 
 func promptForAccessKey() (string, bool) {
@@ -200,14 +256,14 @@ func validateAWSCredentials(ctx context.Context, accessKey string, secretAccessK
 	return userNameParts[2], true, nil
 }
 
-/*func (c *initCommand) createArchiveFile(archiveFile string, rootFolder string) (func() error, error) {
+func getArchiveID(rootFolder string, awsAccessKey string, machineID string) string {
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%s", rootFolder, awsAccessKey, machineID)))
+	id := hex.EncodeToString(hash[:8])
+	return id
+}
 
-	uniqueMachineID, err := getUniqueMachineID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get unique machine ID: %s", err)
-	}
-
-	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%s", c.config.AccessKey, rootFolder, uniqueMachineID)))
+/*func createArchiveFile(archiveFile string, rootFolder string, awsAccessKey string, machineID string) (func() error, error) {
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%s", rootFolder, awsAccessKey, machineID)))
 	id := hex.EncodeToString(hash[:])
 
 	archiveFileData := ArchiveFileData{
@@ -229,14 +285,14 @@ func validateAWSCredentials(ctx context.Context, accessKey string, secretAccessK
 	}, nil
 }*/
 
-/*func deleteArchiveFile(archiveFile string) error {
+func deleteArchiveFile(archiveFile string) error {
 	err := os.Remove(archiveFile)
 	if err != nil {
 		return fmt.Errorf("failed to delete metadata file: %s", err)
 	}
 
 	return nil
-}*/
+}
 
 /*func (c *initCommand) checkBucketEmpty(ctx context.Context) error {
 	objects, err := c.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -289,14 +345,6 @@ func (c *initCommand) deleteManifestFile(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-func getUniqueMachineID() (string, error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "", fmt.Errorf("failed to get hostname: %s", err)
-	}
-	return hostname, nil
 }*/
 
 func isInt(s string) bool {

@@ -22,5 +22,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.4 // indirect
 	github.com/aws/smithy-go v1.28.5 // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
 )

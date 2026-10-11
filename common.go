@@ -1,4 +1,4 @@
 package vaultzero
 
 const archiveFileName = ".vaultzero"
-const configDir = "VaultZero"
+const dataDir = "VaultZero"
