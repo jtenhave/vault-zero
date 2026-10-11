@@ -1,6 +1,7 @@
 package vaultzero
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
@@ -52,18 +55,20 @@ func Init(ctx context.Context, args []string) error {
 	}
 
 	var awsAccessKey string
+	var secretAccessKey string
+	var userId string
 	for {
 		awsAccessKey, isValid = promptForAccessKey()
 		if !isValid {
 			continue
 		}
 
-		secretAccessKey, isValid := promptForSecretAccessKey()
+		secretAccessKey, isValid = promptForSecretAccessKey()
 		if !isValid {
 			continue
 		}
 
-		_, isValid, err = validateAWSCredentials(ctx, awsAccessKey, secretAccessKey)
+		userId, isValid, err = validateAWSCredentials(ctx, awsAccessKey, secretAccessKey)
 		if err != nil {
 			return err
 		}
@@ -78,12 +83,9 @@ func Init(ctx context.Context, args []string) error {
 	fmt.Println("✅ AWS credentials validated.")
 
 	archiveID := getArchiveID(rootFolder, awsAccessKey, machineID)
+	bucketName := getBucketName(userId)
 
-	fmt.Println("Archive ID: ", archiveID)
-
-	fmt.Println("Initializing vault-zero in: ", rootFolder)
 	rollbacks := []func() error{}
-
 	defer func() {
 		if err != nil {
 			for _, rollback := range rollbacks {
@@ -92,11 +94,18 @@ func Init(ctx context.Context, args []string) error {
 		}
 	}()
 
-	/*archiveFile, err := createArchiveFile(rootFolder, awsAccessKey, machineID)
+	rollbackFunc, isValid, err := validateS3Bucket(ctx, archiveID, bucketName, awsAccessKey, secretAccessKey)
+	if !isValid {
+		return err
+	}
+
 	if err != nil {
 		return err
 	}
-	rollbacks = append(rollbacks, archiveFile)*/
+
+	rollbacks = append(rollbacks, rollbackFunc)
+
+	fmt.Println("Initializing vault-zero in: ", rootFolder)
 
 	return nil
 }
@@ -260,6 +269,103 @@ func getArchiveID(rootFolder string, awsAccessKey string, machineID string) stri
 	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%s", rootFolder, awsAccessKey, machineID)))
 	id := hex.EncodeToString(hash[:8])
 	return id
+}
+
+func getBucketName(userId string) string {
+	return fmt.Sprintf("vz-archive-%s", userId)
+}
+
+func validateS3Bucket(ctx context.Context, archiveID string, bucketName string, accessKey string, secretAccessKey string) (func() error, bool, error) {
+	client, err := vzaws.NewS3Client(ctx, accessKey, secretAccessKey)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to create S3 client: %w", err)
+	}
+
+	objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(bucketName),
+		Prefix:  aws.String(fmt.Sprintf("%s/", archiveID)),
+		MaxKeys: aws.Int32(1),
+	})
+
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to list objects in bucket: %w", err)
+	}
+
+	if len(objects.Contents) > 0 {
+		return nil, false, fmt.Errorf("bucket is not empty")
+	}
+
+	accessKeyHash := sha256.Sum256([]byte(accessKey))
+	accessKeyHashString := hex.EncodeToString(accessKeyHash[:8])
+	accessKeyRegisterKey := fmt.Sprintf("keys/%s", accessKeyHashString)
+
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(accessKeyRegisterKey),
+		Body:        bytes.NewReader([]byte{}),
+		IfNoneMatch: aws.String("*"),
+	})
+
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.ErrorCode() {
+			case "PreconditionFailed":
+			case "ConditionalRequestConflict":
+				fmt.Println("❌ AWS key already in use. Please try again with a different key.")
+				return nil, false, nil
+			default:
+				return nil, false, fmt.Errorf("failed to register key: %w", err)
+			}
+		}
+	}
+
+	rollbacks := []func() error{
+		func() error {
+			_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(bucketName),
+				Key:    aws.String(accessKeyRegisterKey),
+			})
+			return err
+		},
+	}
+
+	rollbackFunc := func() error {
+		var err error
+		for _, rollback := range rollbacks {
+			err = rollback()
+		}
+		return err
+	}
+
+	manifest := Manifest{}
+	manifestFileData, err := json.Marshal(manifest)
+	manifestRegisterKey := fmt.Sprintf("%s/%s", archiveID, manifestFileName)
+
+	if err != nil {
+		return rollbackFunc, false, fmt.Errorf("failed to marshal manifest file to JSON: %w", err)
+	}
+
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(manifestRegisterKey),
+		Body:        bytes.NewReader(manifestFileData),
+		IfNoneMatch: aws.String("*"),
+	})
+
+	if err != nil {
+		return rollbackFunc, false, fmt.Errorf("failed to upload manifest file to bucket: %w", err)
+	}
+
+	rollbacks = append(rollbacks, func() error {
+		_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    aws.String(manifestRegisterKey),
+		})
+		return err
+	})
+
+	return rollbackFunc, true, nil
 }
 
 /*func createArchiveFile(archiveFile string, rootFolder string, awsAccessKey string, machineID string) (func() error, error) {
