@@ -31,60 +31,14 @@ type ArchiveFileData struct {
 	ID string `json:"id"`
 }
 
-func Init(ctx context.Context, args []string) error {
-	if len(args) < 1 {
-		fmt.Println("⚠️ Usage: vault-zero init <root folder>")
-		return nil
-	}
+type DataDirFileData struct {
+	ID              string `json:"id"`
+	BucketName      string `json:"bucket_name"`
+	AccessKey       string `json:"access_key"`
+	SecretAccessKey string `json:"secret_access_key"`
+}
 
-	rootFolder, isValid, err := validateRootFolder(args[0])
-	if !isValid {
-		return err
-	}
-
-	_, isValid, err = validateNoArchiveFile(rootFolder)
-	if !isValid {
-		return err
-	}
-
-	fmt.Println("✅ Root folder validated.")
-
-	_, machineID, err := ensureDataDir()
-	if err != nil {
-		return err
-	}
-
-	var awsAccessKey string
-	var secretAccessKey string
-	var userId string
-	for {
-		awsAccessKey, isValid = promptForAccessKey()
-		if !isValid {
-			continue
-		}
-
-		secretAccessKey, isValid = promptForSecretAccessKey()
-		if !isValid {
-			continue
-		}
-
-		userId, isValid, err = validateAWSCredentials(ctx, awsAccessKey, secretAccessKey)
-		if err != nil {
-			return err
-		}
-
-		if !isValid {
-			continue
-		}
-
-		break
-	}
-
-	fmt.Println("✅ AWS credentials validated.")
-
-	archiveID := getArchiveID(rootFolder, awsAccessKey, machineID)
-	bucketName := getBucketName(userId)
-
+func Init(ctx context.Context, args []string) (err error) {
 	rollbacks := []func() error{}
 	defer func() {
 		if err != nil {
@@ -94,7 +48,56 @@ func Init(ctx context.Context, args []string) error {
 		}
 	}()
 
-	rollbackFunc, isValid, err := validateS3Bucket(ctx, archiveID, bucketName, awsAccessKey, secretAccessKey)
+	if len(args) < 1 {
+		fmt.Println("⚠️ Usage: vault-zero init <root folder>")
+		return nil
+	}
+
+	fmt.Println("Starting vault-zero archive initialization...")
+
+	var isValid bool
+	rootFolder, isValid, err := validateRootFolder(args[0])
+	if !isValid {
+		return err
+	}
+
+	var bucketName string
+	var accessKey string
+	var secretAccessKey string
+
+	for {
+		accessKey, isValid = promptForAccessKey()
+		if !isValid {
+			continue
+		}
+
+		secretAccessKey, isValid = promptForSecretAccessKey()
+		if !isValid {
+			continue
+		}
+
+		userId, isValid, err := validateAWSCredentials(ctx, accessKey, secretAccessKey)
+		if err != nil {
+			return err
+		}
+
+		if !isValid {
+			continue
+		}
+
+		bucketName = fmt.Sprintf("vz-archive-%s", userId)
+
+		break
+	}
+
+	archiveID, dataDirRollbackFunc, err := setupDataDir(rootFolder, bucketName, accessKey, secretAccessKey)
+	if err != nil {
+		return err
+	}
+
+	rollbacks = append(rollbacks, dataDirRollbackFunc)
+
+	rollbackFunc, isValid, err := validateS3Bucket(ctx, archiveID, bucketName, accessKey, secretAccessKey)
 	if !isValid {
 		return err
 	}
@@ -105,12 +108,21 @@ func Init(ctx context.Context, args []string) error {
 
 	rollbacks = append(rollbacks, rollbackFunc)
 
-	fmt.Println("Initializing vault-zero in: ", rootFolder)
+	archiveFileRollbackFunc, err := createArchiveFile(rootFolder, archiveID)
+	if err != nil {
+		return err
+	}
+
+	rollbacks = append(rollbacks, archiveFileRollbackFunc)
+
+	fmt.Println("✅ Vault-zero successfully initialized for root folder: ", rootFolder)
 
 	return nil
 }
 
 func validateRootFolder(rootFolder string) (string, bool, error) {
+	fmt.Printf("Checking root folder: %s...\n", rootFolder)
+
 	info, err := os.Stat(rootFolder)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -127,81 +139,23 @@ func validateRootFolder(rootFolder string) (string, bool, error) {
 	}
 
 	trimmedRootFolder := strings.Trim(strings.Trim(rootFolder, "\\"), "/")
-	return trimmedRootFolder, true, nil
-}
 
-func validateNoArchiveFile(rootFolder string) (string, bool, error) {
-	archiveFile := fmt.Sprintf("%s\\%s", rootFolder, archiveFileName)
-	_, err := os.Stat(archiveFile)
+	archiveFile := getArchiveFilePath(trimmedRootFolder)
+	_, err = os.Stat(archiveFile)
 	if err == nil {
-		fmt.Println("❌ Root folder already initialized")
+		fmt.Println("❌ Root folder already initialized as a vault-zero archive")
 		return "", false, nil
 	} else if !os.IsNotExist(err) {
 		return "", false, fmt.Errorf("cannot stat archive file: %s", archiveFile)
 	}
 
-	return archiveFile, true, nil
+	fmt.Println("✅ Root folder is valid.")
+
+	return trimmedRootFolder, true, nil
 }
 
-func ensureDataDir() (string, string, error) {
-	userConfigDir, err := os.UserConfigDir()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get user config dir: %s", err)
-	}
-
-	dataDirPath := fmt.Sprintf("%s\\%s", userConfigDir, dataDir)
-
-	_, err = os.Stat(dataDirPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err = os.MkdirAll(dataDirPath, 0755)
-			if err != nil {
-				return "", "", fmt.Errorf("failed to create data dir: %s", err)
-			}
-		} else {
-			return "", "", fmt.Errorf("cannot stat data dir: %s", dataDirPath)
-		}
-	}
-
-	machineID := ""
-	globalMetadataFilePath := fmt.Sprintf("%s\\%s", dataDirPath, globalMetadataFileName)
-
-	globalMetadataFileRaw, err := os.ReadFile(globalMetadataFilePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			machineIDGuid, err := uuid.NewRandom()
-			if err != nil {
-				return "", "", fmt.Errorf("failed to generate machine ID: %s", err)
-			}
-
-			machineID = machineIDGuid.String()
-			globalMetadataFileData := GlobalMetadataFileData{
-				MachineID: machineID,
-			}
-
-			globalMetadataFileRaw, err := json.Marshal(globalMetadataFileData)
-			if err != nil {
-				return "", "", fmt.Errorf("error marshaling metadata file to JSON: %s", err)
-			}
-
-			err = os.WriteFile(globalMetadataFilePath, globalMetadataFileRaw, 0644)
-			if err != nil {
-				return "", "", fmt.Errorf("failed to write metadata file to root folder: %s", err)
-			}
-
-			return dataDirPath, machineID, nil
-		}
-
-		return "", "", fmt.Errorf("cannot read global metadata file: %s", globalMetadataFilePath)
-	} else {
-		globalMetadataFileData := GlobalMetadataFileData{}
-		err = json.Unmarshal(globalMetadataFileRaw, &globalMetadataFileData)
-		if err != nil {
-			return "", "", fmt.Errorf("failed to unmarshal global metadata file: %s", err)
-		}
-
-		return dataDirPath, globalMetadataFileData.MachineID, nil
-	}
+func getArchiveFilePath(rootFolder string) string {
+	return fmt.Sprintf("%s\\%s", rootFolder, archiveFileName)
 }
 
 func promptForAccessKey() (string, bool) {
@@ -231,6 +185,8 @@ func promptForSecretAccessKey() (string, bool) {
 }
 
 func validateAWSCredentials(ctx context.Context, accessKey string, secretAccessKey string) (string, bool, error) {
+	fmt.Println("Validating AWS credentials...")
+
 	stsClient, err := vzaws.NewSTSClient(ctx, accessKey, secretAccessKey)
 	if err != nil {
 		return "", false, fmt.Errorf("failed to create STS client: %w", err)
@@ -262,37 +218,108 @@ func validateAWSCredentials(ctx context.Context, accessKey string, secretAccessK
 		return "", false, nil
 	}
 
+	fmt.Println("✅ AWS credentials validated.")
+
 	return userNameParts[2], true, nil
 }
 
-func getArchiveID(rootFolder string, awsAccessKey string, machineID string) string {
-	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%s", rootFolder, awsAccessKey, machineID)))
-	id := hex.EncodeToString(hash[:8])
-	return id
-}
+func setupDataDir(rootFolder string, bucketName string, accessKey string, secretAccessKey string) (string, func() error, error) {
+	fmt.Println("Setting up vault-zero data directory...")
 
-func getBucketName(userId string) string {
-	return fmt.Sprintf("vz-archive-%s", userId)
+	userConfigDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to get user config dir: %s", err)
+	}
+
+	dataDirPath := fmt.Sprintf("%s\\%s", userConfigDir, dataDir)
+
+	_, err = os.Stat(dataDirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			err = os.MkdirAll(dataDirPath, 0755)
+			if err != nil {
+				return "", nil, fmt.Errorf("failed to create data dir: %s", err)
+			}
+		} else {
+			return "", nil, fmt.Errorf("cannot stat data dir: %s", dataDirPath)
+		}
+	}
+
+	machineID := ""
+	globalMetadataFilePath := fmt.Sprintf("%s\\%s", dataDirPath, globalMetadataFileName)
+
+	globalMetadataFileRaw, err := os.ReadFile(globalMetadataFilePath)
+	globalMetadataFileData := GlobalMetadataFileData{}
+	if err != nil {
+		if os.IsNotExist(err) {
+			machineIDGuid, err := uuid.NewRandom()
+			if err != nil {
+				return "", nil, fmt.Errorf("failed to generate machine ID: %s", err)
+			}
+
+			machineID = machineIDGuid.String()
+			globalMetadataFileData.MachineID = machineID
+
+			globalMetadataFileRaw, err := json.Marshal(globalMetadataFileData)
+			if err != nil {
+				return "", nil, fmt.Errorf("error marshaling metadata file to JSON: %s", err)
+			}
+
+			err = writeLocalFile(globalMetadataFilePath, globalMetadataFileRaw)
+			if err != nil {
+				return "", nil, fmt.Errorf("failed to write global metadata file: %s", err)
+			}
+		} else {
+			return "", nil, fmt.Errorf("cannot read global metadata file: %s", globalMetadataFilePath)
+		}
+	} else {
+		err = json.Unmarshal(globalMetadataFileRaw, &globalMetadataFileData)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to unmarshal global metadata file: %s", err)
+		}
+
+		machineID = globalMetadataFileData.MachineID
+	}
+
+	archiveIDHash := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%s", rootFolder, accessKey, machineID)))
+	archiveID := hex.EncodeToString(archiveIDHash[:8])
+
+	dataDirFileData := DataDirFileData{
+		ID:              archiveID,
+		BucketName:      bucketName,
+		AccessKey:       accessKey,
+		SecretAccessKey: secretAccessKey,
+	}
+
+	dataDirFileDataBytes, err := json.Marshal(dataDirFileData)
+	if err != nil {
+		return "", nil, fmt.Errorf("error marshaling data dir file to JSON: %s", err)
+	}
+
+	dataDirFilePath := fmt.Sprintf("%s\\%s.json", dataDirPath, archiveID)
+	err = writeLocalFile(dataDirFilePath, dataDirFileDataBytes)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to write data dir file: %s", err)
+	}
+
+	fmt.Println("✅ Data directory setup complete.")
+
+	return archiveID, func() error {
+		err := os.Remove(dataDirFilePath)
+		if err != nil {
+			return fmt.Errorf("failed to delete data dir file: %s", err)
+		}
+
+		return nil
+	}, nil
 }
 
 func validateS3Bucket(ctx context.Context, archiveID string, bucketName string, accessKey string, secretAccessKey string) (func() error, bool, error) {
+	fmt.Println("Connecting to cloud storage...")
+
 	client, err := vzaws.NewS3Client(ctx, accessKey, secretAccessKey)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to create S3 client: %w", err)
-	}
-
-	objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket:  aws.String(bucketName),
-		Prefix:  aws.String(fmt.Sprintf("%s/", archiveID)),
-		MaxKeys: aws.Int32(1),
-	})
-
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to list objects in bucket: %w", err)
-	}
-
-	if len(objects.Contents) > 0 {
-		return nil, false, fmt.Errorf("bucket is not empty")
 	}
 
 	accessKeyHash := sha256.Sum256([]byte(accessKey))
@@ -310,9 +337,8 @@ func validateS3Bucket(ctx context.Context, archiveID string, bucketName string, 
 		var apiErr smithy.APIError
 		if errors.As(err, &apiErr) {
 			switch apiErr.ErrorCode() {
-			case "PreconditionFailed":
-			case "ConditionalRequestConflict":
-				fmt.Println("❌ AWS key already in use. Please try again with a different key.")
+			case "PreconditionFailed", "ConditionalRequestConflict":
+				fmt.Println("❌ AWS key already in use for this user. Please try again with a different key.")
 				return nil, false, nil
 			default:
 				return nil, false, fmt.Errorf("failed to register key: %w", err)
@@ -336,6 +362,20 @@ func validateS3Bucket(ctx context.Context, archiveID string, bucketName string, 
 			err = rollback()
 		}
 		return err
+	}
+
+	objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(bucketName),
+		Prefix:  aws.String(fmt.Sprintf("%s/", archiveID)),
+		MaxKeys: aws.Int32(1),
+	})
+
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to list objects in bucket: %w", err)
+	}
+
+	if len(objects.Contents) > 0 {
+		return nil, false, fmt.Errorf("bucket is not empty")
 	}
 
 	manifest := Manifest{}
@@ -365,15 +405,18 @@ func validateS3Bucket(ctx context.Context, archiveID string, bucketName string, 
 		return err
 	})
 
+	fmt.Println("✅ Successfully connected to cloud storage.")
+
 	return rollbackFunc, true, nil
 }
 
-/*func createArchiveFile(archiveFile string, rootFolder string, awsAccessKey string, machineID string) (func() error, error) {
-	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%s", rootFolder, awsAccessKey, machineID)))
-	id := hex.EncodeToString(hash[:])
+func createArchiveFile(rootFolder string, archiveID string) (func() error, error) {
+	fmt.Println("Intializing local folder as archive...")
+
+	archiveFilePath := getArchiveFilePath(rootFolder)
 
 	archiveFileData := ArchiveFileData{
-		ID: id,
+		ID: archiveID,
 	}
 
 	archiveFileDataBytes, err := json.Marshal(archiveFileData)
@@ -381,77 +424,41 @@ func validateS3Bucket(ctx context.Context, archiveID string, bucketName string, 
 		return nil, fmt.Errorf("error marshaling metadata file to JSON: %s", err)
 	}
 
-	err = os.WriteFile(archiveFile, archiveFileDataBytes, 0644)
+	err = writeLocalFile(archiveFilePath, archiveFileDataBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to write metadata file to root folder: %s", err)
+		return nil, fmt.Errorf("failed to write archive file: %s", err)
 	}
+
+	fmt.Println("✅ Successfully initialized local folder as archive.")
 
 	return func() error {
-		return deleteArchiveFile(archiveFile)
-	}, nil
-}*/
+		err := os.Remove(archiveFilePath)
+		if err != nil {
+			return fmt.Errorf("failed to delete archive file: %s", err)
+		}
 
-func deleteArchiveFile(archiveFile string) error {
-	err := os.Remove(archiveFile)
-	if err != nil {
-		return fmt.Errorf("failed to delete metadata file: %s", err)
-	}
-
-	return nil
-}
-
-/*func (c *initCommand) checkBucketEmpty(ctx context.Context) error {
-	objects, err := c.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(c.config.BucketName),
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to list objects in bucket: %s", err)
-	}
-
-	if len(objects.Contents) > 0 {
-		return fmt.Errorf("bucket is not empty")
-	}
-
-	return nil
-}
-
-func (c *initCommand) uploadManifestFile(ctx context.Context) (func() error, error) {
-	manifest := Manifest{}
-
-	manifestFileData, err := json.Marshal(manifest)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal manifest file to JSON: %s", err)
-	}
-
-	_, err = c.s3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(c.config.BucketName),
-		Key:         aws.String(manifestFileName),
-		Body:        bytes.NewReader(manifestFileData),
-		IfNoneMatch: aws.String("*"),
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to upload manifest file to bucket: %s", err)
-	}
-
-	return func() error {
-		return c.deleteManifestFile(ctx)
+		return nil
 	}, nil
 }
 
-func (c *initCommand) deleteManifestFile(ctx context.Context) error {
-	_, err := c.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(c.config.BucketName),
-		Key:    aws.String(manifestFileName),
-	})
-
+func writeLocalFile(filepath string, data []byte) error {
+	file, err := os.OpenFile(filepath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to delete manifest file from bucket: %s", err)
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("file already exists")
+		} else {
+			return fmt.Errorf("failed to create file: %w", err)
+		}
+	}
+
+	defer file.Close()
+
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
 	}
 
 	return nil
-}*/
+}
 
 func isInt(s string) bool {
 	_, err := strconv.Atoi(s)
