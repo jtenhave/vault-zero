@@ -20,22 +20,10 @@ import (
 	vzaws "github.com/jtenhave/vaultzero/aws"
 )
 
-const manifestFileName = "manifest.json"
 const globalMetadataFileName = "global_metadata.json"
 
 type GlobalMetadataFileData struct {
 	MachineID string `json:"machine_id"`
-}
-
-type ArchiveFileData struct {
-	ID string `json:"id"`
-}
-
-type DataDirFileData struct {
-	ID              string `json:"id"`
-	BucketName      string `json:"bucket_name"`
-	AccessKey       string `json:"access_key"`
-	SecretAccessKey string `json:"secret_access_key"`
 }
 
 func Init(ctx context.Context, args []string) (err error) {
@@ -226,12 +214,10 @@ func validateAWSCredentials(ctx context.Context, accessKey string, secretAccessK
 func setupDataDir(rootFolder string, bucketName string, accessKey string, secretAccessKey string) (string, func() error, error) {
 	fmt.Println("Setting up vault-zero data directory...")
 
-	userConfigDir, err := os.UserConfigDir()
+	dataDirPath, err := getDataDirFilePath()
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to get user config dir: %s", err)
+		return "", nil, fmt.Errorf("failed to get data dir path: %s", err)
 	}
-
-	dataDirPath := fmt.Sprintf("%s\\%s", userConfigDir, dataDir)
 
 	_, err = os.Stat(dataDirPath)
 	if err != nil {
@@ -380,7 +366,7 @@ func validateS3Bucket(ctx context.Context, archiveID string, bucketName string, 
 
 	manifest := Manifest{}
 	manifestFileData, err := json.Marshal(manifest)
-	manifestRegisterKey := fmt.Sprintf("%s/%s", archiveID, manifestFileName)
+	manifestRegisterKey := getManifestFileKey(archiveID)
 
 	if err != nil {
 		return rollbackFunc, false, fmt.Errorf("failed to marshal manifest file to JSON: %w", err)
