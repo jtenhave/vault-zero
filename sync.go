@@ -3,11 +3,12 @@ package vaultzero
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -17,10 +18,11 @@ import (
 )
 
 type syncState struct {
-	archiveID  string
-	s3Client   *s3.Client
-	manifest   *Manifest
-	bucketName string
+	archiveID        string
+	s3Client         *s3.Client
+	manifest         *Manifest
+	bucketName       string
+	localFileHashMap map[string]string
 }
 
 func Sync(ctx context.Context, rootFolder string) (err error) {
@@ -129,56 +131,112 @@ func (syncState *syncState) syncFolder(ctx context.Context, folder string) (err 
 		return fmt.Errorf("failed to read folder: %s error: %w", folder, err)
 	}
 
+	folders := make([]string, 0)
 	for _, localFile := range localFiles {
 		filePath := filepath.Join(folder, localFile.Name())
-		base64FilePath := base64.StdEncoding.EncodeToString([]byte(filePath))
-
-		// STEP 1: Check if file is a directory
 		if localFile.IsDir() {
-			return syncState.syncFolder(ctx, filePath)
+			folders = append(folders, filePath)
+			continue
 		}
 
-		// STEP 2: Check if file exists in the manifest
-		trackedFile, ok := syncState.manifest.fileNameMap[base64FilePath]
+		localFileInfo, err := localFile.Info()
+		if err != nil {
+			return fmt.Errorf("failed to get file info: %s error: %w", filePath, err)
+		}
+
+		encodedFilePath := url.QueryEscape(filePath)
+
+		// Check if file is tracked in the manifest
+		trackedFile, ok := syncState.manifest.fileNameMap[encodedFilePath]
 		if ok {
-			// STEP 3: Check if file is up to date
-			fileInfo, err := localFile.Info()
-			if err != nil {
-				return fmt.Errorf("failed to get file info: %s error: %w", localFile.Name(), err)
+			if trackedFile.Size == localFileInfo.Size() && trackedFile.ModifiedTime == localFileInfo.ModTime() {
+				trackedFile.Found = true
+				continue
 			}
+		}
 
-			if trackedFile.ModifiedTime.After(fileInfo.ModTime()) {
-				// STEP 4: Upload file
-				// UPLOAD FILE
-			}
-		} else {
-			localFileHash, err := hashFile(filePath)
-			if err != nil {
-				return fmt.Errorf("failed to hash file: %s error: %w", localFile.Name(), err)
-			}
+		fileHash, err := syncState.hashFile(encodedFilePath)
+		if err != nil {
+			log.Printf("failed to hash file: %v", filePath, err)
+			continue
+		}
 
-			if localFileHash != trackedFile.Hash {
-				// STEP 4: Upload file
-				// UPLOAD FILE
-			}
+		equivalentTrackedFile, err := syncState.findMovedFile(fileHash)
+		if err != nil {
+			return fmt.Errorf("failed to find moved file: %s error: %w", filePath, err)
+		}
+
+		if equivalentTrackedFile == nil {
+			// NEW
+			// UPLOAD FILE
+			// UPDATE MANIFEST
+			continue
+		}
+
+
+		// MOVED
+		// UPDATE MANIFEST
+		equivalentTrackedFile.Found = true
+	}
+
+	// Do folders last.
+	for _, folder := range folders {
+		err = syncState.syncFolder(ctx, folder)
+		if err != nil {
+			return fmt.Errorf("failed to sync folder: %s error: %w", folder, err)
 		}
 	}
 
 	return nil
 }
 
-func hashFile(filePath string) (string, error) {
+func (syncState *syncState) findMovedFile(fileHash string) (*File, error) {
+	equivalentTrackedFiles, ok := syncState.manifest.hashMap[fileHash]
+	if ok {
+		for _, equivalentTrackedFile := range equivalentTrackedFiles {
+			localEquivalentFilePath, err := url.QueryUnescape(equivalentTrackedFile.Path)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode equivalent file path: %s error: %w", equivalentTrackedFile.Path, err)
+			}
+
+			_, err = os.Stat(localEquivalentFilePath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return equivalentTrackedFile, nil
+				}
+
+				return nil, fmt.Errorf("failed to stat file: %s error: %w", localEquivalentFilePath, err)
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+func (syncState *syncState) hashFile(encodedFilePath string) (string, error) {
+	hash, ok := syncState.localFileHashMap[encodedFilePath]
+	if ok {
+		return hash, nil
+	}
+
+	filePath, err := url.QueryUnescape(encodedFilePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode file path: %s error: %w", encodedFilePath, err)
+	}
+
 	localFile, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open file: %s error: %w", filePath, err)
 	}
 	defer localFile.Close()
 
-	hash := sha256.New()
-	_, err = io.Copy(hash, localFile)
+	newHash := sha256.New()
+	_, err = io.Copy(newHash, localFile)
 	if err != nil {
 		return "", fmt.Errorf("failed to hash file: %s error: %w", filePath, err)
 	}
 
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	hash = hex.EncodeToString(newHash.Sum(nil))
+	syncState.localFileHashMap[encodedFilePath] = hash
+	return hash, nil
 }
