@@ -96,10 +96,13 @@ func Init(ctx context.Context, args []string) (err error) {
 
 	rollbacks = append(rollbacks, rollbackFunc)
 
-	archiveFileRollbackFunc, err := createArchiveFile(rootFolder, archiveID)
+	fmt.Println("Intializing local folder as archive...")
+	archiveFileRollbackFunc, err := setArchiveFileData(rootFolder, archiveID)
 	if err != nil {
 		return err
 	}
+
+	fmt.Println("✅ Successfully initialized local folder as archive.")
 
 	rollbacks = append(rollbacks, archiveFileRollbackFunc)
 
@@ -128,22 +131,19 @@ func validateRootFolder(rootFolder string) (string, bool, error) {
 
 	trimmedRootFolder := strings.Trim(strings.Trim(rootFolder, "\\"), "/")
 
-	archiveFile := getArchiveFilePath(trimmedRootFolder)
-	_, err = os.Stat(archiveFile)
-	if err == nil {
+	archiveFileData, err := getArchiveFileData(trimmedRootFolder)
+	if err != nil {
+		return "", false, fmt.Errorf("cannot get archive file data: %s", err)
+	}
+
+	if archiveFileData != nil {
 		fmt.Println("❌ Root folder already initialized as a vault-zero archive")
 		return "", false, nil
-	} else if !os.IsNotExist(err) {
-		return "", false, fmt.Errorf("cannot stat archive file: %s", archiveFile)
 	}
 
 	fmt.Println("✅ Root folder is valid.")
 
 	return trimmedRootFolder, true, nil
-}
-
-func getArchiveFilePath(rootFolder string) string {
-	return fmt.Sprintf("%s\\%s", rootFolder, archiveFileName)
 }
 
 func promptForAccessKey() (string, bool) {
@@ -214,25 +214,25 @@ func validateAWSCredentials(ctx context.Context, accessKey string, secretAccessK
 func setupDataDir(rootFolder string, bucketName string, accessKey string, secretAccessKey string) (string, func() error, error) {
 	fmt.Println("Setting up vault-zero data directory...")
 
-	dataDirPath, err := getDataDirFilePath()
+	settingsDirPath, err := getSettingsDirPath()
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to get data dir path: %s", err)
 	}
 
-	_, err = os.Stat(dataDirPath)
+	_, err = os.Stat(settingsDirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			err = os.MkdirAll(dataDirPath, 0755)
+			err = os.MkdirAll(settingsDirPath, 0755)
 			if err != nil {
 				return "", nil, fmt.Errorf("failed to create data dir: %s", err)
 			}
 		} else {
-			return "", nil, fmt.Errorf("cannot stat data dir: %s", dataDirPath)
+			return "", nil, fmt.Errorf("cannot stat settings dir: %s", settingsDirPath)
 		}
 	}
 
 	machineID := ""
-	globalMetadataFilePath := fmt.Sprintf("%s\\%s", dataDirPath, globalMetadataFileName)
+	globalMetadataFilePath := fmt.Sprintf("%s\\%s", settingsDirPath, globalMetadataFileName)
 
 	globalMetadataFileRaw, err := os.ReadFile(globalMetadataFilePath)
 	globalMetadataFileData := GlobalMetadataFileData{}
@@ -251,7 +251,7 @@ func setupDataDir(rootFolder string, bucketName string, accessKey string, secret
 				return "", nil, fmt.Errorf("error marshaling metadata file to JSON: %s", err)
 			}
 
-			err = writeLocalFile(globalMetadataFilePath, globalMetadataFileRaw)
+			err = writeNewLocalFile(globalMetadataFilePath, globalMetadataFileRaw)
 			if err != nil {
 				return "", nil, fmt.Errorf("failed to write global metadata file: %s", err)
 			}
@@ -270,34 +270,21 @@ func setupDataDir(rootFolder string, bucketName string, accessKey string, secret
 	archiveIDHash := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%s", rootFolder, accessKey, machineID)))
 	archiveID := hex.EncodeToString(archiveIDHash[:8])
 
-	dataDirFileData := DataDirFileData{
+	settingsFileData := settingsFileData{
 		ID:              archiveID,
 		BucketName:      bucketName,
 		AccessKey:       accessKey,
 		SecretAccessKey: secretAccessKey,
 	}
 
-	dataDirFileDataBytes, err := json.Marshal(dataDirFileData)
+	rollbackFunc, err := setSettingsFileData(archiveID, settingsFileData)
 	if err != nil {
-		return "", nil, fmt.Errorf("error marshaling data dir file to JSON: %s", err)
-	}
-
-	dataDirFilePath := fmt.Sprintf("%s\\%s.json", dataDirPath, archiveID)
-	err = writeLocalFile(dataDirFilePath, dataDirFileDataBytes)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to write data dir file: %s", err)
+		return "", nil, fmt.Errorf("failed to set settings file data: %w", err)
 	}
 
 	fmt.Println("✅ Data directory setup complete.")
 
-	return archiveID, func() error {
-		err := os.Remove(dataDirFilePath)
-		if err != nil {
-			return fmt.Errorf("failed to delete data dir file: %s", err)
-		}
-
-		return nil
-	}, nil
+	return archiveID, rollbackFunc, nil
 }
 
 func validateS3Bucket(ctx context.Context, archiveID string, bucketName string, accessKey string, secretAccessKey string) (func() error, bool, error) {
@@ -394,56 +381,6 @@ func validateS3Bucket(ctx context.Context, archiveID string, bucketName string, 
 	fmt.Println("✅ Successfully connected to cloud storage.")
 
 	return rollbackFunc, true, nil
-}
-
-func createArchiveFile(rootFolder string, archiveID string) (func() error, error) {
-	fmt.Println("Intializing local folder as archive...")
-
-	archiveFilePath := getArchiveFilePath(rootFolder)
-
-	archiveFileData := ArchiveFileData{
-		ID: archiveID,
-	}
-
-	archiveFileDataBytes, err := json.Marshal(archiveFileData)
-	if err != nil {
-		return nil, fmt.Errorf("error marshaling metadata file to JSON: %s", err)
-	}
-
-	err = writeLocalFile(archiveFilePath, archiveFileDataBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to write archive file: %s", err)
-	}
-
-	fmt.Println("✅ Successfully initialized local folder as archive.")
-
-	return func() error {
-		err := os.Remove(archiveFilePath)
-		if err != nil {
-			return fmt.Errorf("failed to delete archive file: %s", err)
-		}
-
-		return nil
-	}, nil
-}
-
-func writeLocalFile(filepath string, data []byte) error {
-	file, err := os.OpenFile(filepath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("file already exists")
-		} else {
-			return fmt.Errorf("failed to create file: %w", err)
-		}
-	}
-
-	defer file.Close()
-
-	if _, err := file.Write(data); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
-	}
-
-	return nil
 }
 
 func isInt(s string) bool {

@@ -17,67 +17,49 @@ import (
 	vzaws "github.com/jtenhave/vaultzero/aws"
 )
 
+type writeObject struct {
+	manifestFile    *File
+	encodedFilePath string
+	uploadFile      bool
+}
+
 type syncState struct {
 	archiveID        string
 	s3Client         *s3.Client
 	manifest         *Manifest
 	bucketName       string
 	localFileHashMap map[string]string
+	uploadChannel    chan *writeObject
 }
 
 func Sync(ctx context.Context, rootFolder string) (err error) {
-	archiveFilePath := filepath.Join(rootFolder, ".vaultzero")
-	archiveFileRaw, err := os.ReadFile(archiveFilePath)
+	archiveFileData, err := getArchiveFileData(rootFolder)
 	if err != nil {
-		return fmt.Errorf("failed to read archive file: %w", err)
+		return fmt.Errorf("sync: failed to get archive file data: %w", err)
 	}
 
-	var archiveFileData ArchiveFileData
-	err = json.Unmarshal(archiveFileRaw, &archiveFileData)
+	settingsFileData, err := getSettingsFileData(archiveFileData.ID)
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal archive file data: %w", err)
+		return fmt.Errorf("sync: failed to get settings file data: %w", err)
 	}
 
-	archiveID := archiveFileData.ID
-	if archiveID == "" {
-		return fmt.Errorf("archive ID is empty")
-	}
-
-	dataDirFilePath, err := getDataDirFilePath()
-	if err != nil {
-		return fmt.Errorf("failed to get data dir file path: %w", err)
-	}
-
-	dataDirFileRaw, err := os.ReadFile(dataDirFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to read data dir file: %w", err)
-	}
-
-	var dataDirFileData DataDirFileData
-	err = json.Unmarshal(dataDirFileRaw, &dataDirFileData)
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal data dir file data: %w", err)
-	}
-
-	if dataDirFileData.AccessKey == "" || dataDirFileData.SecretAccessKey == "" || dataDirFileData.BucketName == "" {
-		return fmt.Errorf("data dir file data is missing required fields")
-	}
-
-	s3Client, err := vzaws.NewS3Client(ctx, dataDirFileData.AccessKey, dataDirFileData.SecretAccessKey)
+	s3Client, err := vzaws.NewS3Client(ctx, settingsFileData.AccessKey, settingsFileData.SecretAccessKey)
 	if err != nil {
 		return fmt.Errorf("failed to create S3 client: %w", err)
 	}
 
 	syncState := &syncState{
-		archiveID:  archiveID,
+		archiveID:  archiveFileData.ID,
 		s3Client:   s3Client,
-		bucketName: dataDirFileData.BucketName,
+		bucketName: settingsFileData.BucketName,
 	}
 
 	err = syncState.loadManifest(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to download manifest: %w", err)
 	}
+
+	syncState.uploadChannel = make(chan *writeObject, 100)
 
 	return nil
 }
@@ -103,8 +85,8 @@ func (syncState *syncState) loadManifest(ctx context.Context) (err error) {
 	}
 
 	for _, file := range manifest.files {
-		syncState.manifest.fileNameMap[file.Path] = file
-		syncState.manifest.hashMap[file.Hash] = append(syncState.manifest.hashMap[file.Hash], file)
+		syncState.manifest.fileNameMap[file.Path] = &file
+		syncState.manifest.hashMap[file.Hash] = append(syncState.manifest.hashMap[file.Hash], &file)
 	}
 
 	syncState.manifest = &manifest
@@ -148,38 +130,38 @@ func (syncState *syncState) syncFolder(ctx context.Context, folder string) (err 
 
 		// Check if file is tracked in the manifest
 		trackedFile, ok := syncState.manifest.fileNameMap[encodedFilePath]
+		uploadFile := false
 		if ok {
-			if trackedFile.Size == localFileInfo.Size() && trackedFile.ModifiedTime == localFileInfo.ModTime() {
-				trackedFile.Found = true
+			if trackedFile.Size == localFileInfo.Size() || trackedFile.ModifiedTime == localFileInfo.ModTime() {
 				continue
+			} else {
+				uploadFile = true
+			}
+		} else {
+			fileHash, err := syncState.hashFile(encodedFilePath)
+			if err != nil {
+				log.Printf("failed to hash file: %v", filePath, err)
+				continue
+			}
+
+			trackedFile, err = syncState.findMovedFile(fileHash)
+			if err != nil {
+				log.Printf("failed to find moved file: %v", filePath, err)
+				continue
+			}
+
+			if trackedFile == nil {
+				uploadFile = true
 			}
 		}
 
-		fileHash, err := syncState.hashFile(encodedFilePath)
-		if err != nil {
-			log.Printf("failed to hash file: %v", filePath, err)
-			continue
+		syncState.uploadChannel <- &writeObject{
+			manifestFile:    trackedFile,
+			encodedFilePath: encodedFilePath,
+			uploadFile:      uploadFile,
 		}
-
-		equivalentTrackedFile, err := syncState.findMovedFile(fileHash)
-		if err != nil {
-			return fmt.Errorf("failed to find moved file: %s error: %w", filePath, err)
-		}
-
-		if equivalentTrackedFile == nil {
-			// NEW
-			// UPLOAD FILE
-			// UPDATE MANIFEST
-			continue
-		}
-
-
-		// MOVED
-		// UPDATE MANIFEST
-		equivalentTrackedFile.Found = true
 	}
 
-	// Do folders last.
 	for _, folder := range folders {
 		err = syncState.syncFolder(ctx, folder)
 		if err != nil {
@@ -190,22 +172,35 @@ func (syncState *syncState) syncFolder(ctx context.Context, folder string) (err 
 	return nil
 }
 
+func (syncState *syncState) startUploadFileWorker(ctx context.Context, uploadChannel chan *writeObject) (err error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case writeObject := <-uploadChannel:
+
+		}
+	}
+
+	return nil
+}
+
 func (syncState *syncState) findMovedFile(fileHash string) (*File, error) {
-	equivalentTrackedFiles, ok := syncState.manifest.hashMap[fileHash]
+	trackedFiles, ok := syncState.manifest.hashMap[fileHash]
 	if ok {
-		for _, equivalentTrackedFile := range equivalentTrackedFiles {
-			localEquivalentFilePath, err := url.QueryUnescape(equivalentTrackedFile.Path)
+		for _, trackedFile := range trackedFiles {
+			localFilePath, err := url.QueryUnescape(trackedFile.Path)
 			if err != nil {
-				return nil, fmt.Errorf("failed to decode equivalent file path: %s error: %w", equivalentTrackedFile.Path, err)
+				return nil, fmt.Errorf("failed to decode tracked file path: %s error: %w", trackedFile.Path, err)
 			}
 
-			_, err = os.Stat(localEquivalentFilePath)
+			_, err = os.Stat(localFilePath)
 			if err != nil {
 				if os.IsNotExist(err) {
-					return equivalentTrackedFile, nil
+					return trackedFile, nil
 				}
 
-				return nil, fmt.Errorf("failed to stat file: %s error: %w", localEquivalentFilePath, err)
+				return nil, fmt.Errorf("failed to stat file: %s error: %w", localFilePath, err)
 			}
 		}
 	}
