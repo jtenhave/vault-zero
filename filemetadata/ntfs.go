@@ -1,36 +1,36 @@
 package filemetadata
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 )
 
-type NTFSFileMetadataProvider struct{}
+type ntfsFileMetadataProvider struct{}
 
-func (p *NTFSFileMetadataProvider) GetFileMetadata(path string) (*FileMetadata, error) {
-	info, err := os.Stat(path)
+func (p *ntfsFileMetadataProvider) GetFileMetadata(path string) (*FileMetadata, error) {
+	fileMetadataRaw, err := os.ReadFile(path + ":vaultzero")
 	if err != nil {
-		return nil, fmt.Errorf("ntfsmetadataprovider: failed to get file metadata: %w", err)
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("ntfsmetadataprovider.GetFileMetadata: failed to read vaultzero id: %w", err)
 	}
 
-	var vaultzeroID *string
-	vaultzeroIDRaw, err := os.ReadFile(path + ":vaultzero")
-	if err == nil {
-		vaultzeroIDStr := string(vaultzeroIDRaw)
-		vaultzeroID = &vaultzeroIDStr
-	} else {
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("ntfsmetadataprovider: failed to read vaultzero id: %w", err)
-		} 
+	var fileMetadata FileMetadata
+	err = json.Unmarshal(fileMetadataRaw, &fileMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("ntfsmetadataprovider.GetFileMetadata: failed to unmarshal file metadata: %w", err)
 	}
 
-	return &FileMetadata{
-		Size:         info.Size(),
-		LastModified: info.ModTime(),
-		VaultZeroID:  vaultzeroID,
-	}, nil
+	return &fileMetadata, nil
 }
 
-func (p *NTFSFileMetadataProvider) SetFileMetadata(path string, metadata FileMetadata) error {
-	return os.WriteFile(path+":vaultzero", []byte(*metadata.VaultZeroID), 0644)
+func (p *ntfsFileMetadataProvider) SetFileMetadata(path string, metadata FileMetadata) error {
+	fileMetadataRaw, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("ntfsmetadataprovider.SetFileMetadata: failed to marshal file metadata: %w", err)
+	}
+
+	return os.WriteFile(path+":vaultzero", fileMetadataRaw, 0644)
 }
