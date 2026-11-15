@@ -13,6 +13,10 @@ func getManifestFileKey(archiveID string) string {
 	return fmt.Sprintf("%s/%s", archiveID, manifestFileName)
 }
 
+func getArchiveFileKey(archiveID string, key string) string {
+	return fmt.Sprintf("%s/%s", archiveID, key)
+}
+
 func writeNewLocalFile(filepath string, data []byte) error {
 	file, err := os.OpenFile(filepath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 )
 
 type FileMetadata struct {
+	VaultPath    string    `json:"path"`
 	Size         int64     `json:"size"`
 	LastModified time.Time `json:"lastModified"`
 	VaultZeroID  string    `json:"vaultzeroId"`

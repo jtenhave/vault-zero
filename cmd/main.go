@@ -13,13 +13,13 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		initCommand(os.Args[2:])
-	case "watch":
-		watchCommand(os.Args[2:])
+	case "sync":
+		syncCommand(os.Args[2:])
 	default:
 		fmt.Println("Usage: vault-zero <command> <args>")
 		fmt.Println("Commands:")
 		fmt.Println("  init <root folder>")
-		fmt.Println("  watch <root folder>")
+		fmt.Println("  sync <root folder>")
 		return
 	}
 }
@@ -32,10 +32,10 @@ func initCommand(args []string) {
 	}
 }
 
-func watchCommand(args []string) {
-	err := vaultzero.Watch(context.Background(), args)
+func syncCommand(args []string) {
+	err := vaultzero.Sync(context.Background(), args[0])
 	if err != nil {
-		fmt.Printf("Failed to watch vault-zero: %v\n", err)
+		fmt.Printf("Failed to sync vault-zero: %v\n", err)
 		return
 	}
 }
