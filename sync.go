@@ -34,7 +34,12 @@ type syncState struct {
 	processChannel       chan string
 }
 
-func Sync(ctx context.Context, rootFolder string) (err error) {
+func Sync(ctx context.Context, rawRootFolder string) (err error) {
+	rootFolder, err := filepath.Abs(rawRootFolder)
+	if err != nil {
+		return fmt.Errorf("sync: failed to parse root folder: %w", err)
+	}
+
 	archiveFileData, err := getArchiveFileData(rootFolder)
 	if err != nil {
 		return fmt.Errorf("sync: failed to get archive file data: %w", err)
@@ -78,7 +83,7 @@ func Sync(ctx context.Context, rootFolder string) (err error) {
 
 		go func() {
 			defer wg.Done()
-			syncState.startUploadFileWorker(ctx, uploadChannel)
+			syncState.startUploadFileWorker(ctx, uploadChannel, i)
 		}()
 	}
 
@@ -181,7 +186,7 @@ func (syncState *syncState) syncFolder(ctx context.Context, folder string) (err 
 	return folderError
 }
 
-func (syncState *syncState) startUploadFileWorker(ctx context.Context, processChannel chan string) (err error) {
+func (syncState *syncState) startUploadFileWorker(ctx context.Context, processChannel chan string, workerID int) (err error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -191,7 +196,7 @@ func (syncState *syncState) startUploadFileWorker(ctx context.Context, processCh
 				return nil
 			}
 
-			err = syncState.processFile(ctx, filePath)
+			err = syncState.processFile(ctx, filePath, workerID)
 			if err != nil {
 				log.Printf("sync.uploadFile: failed to upload file: %s error: %v", filePath, err)
 			}
@@ -199,7 +204,7 @@ func (syncState *syncState) startUploadFileWorker(ctx context.Context, processCh
 	}
 }
 
-func (syncState *syncState) processFile(ctx context.Context, filePath string) (err error) {
+func (syncState *syncState) processFile(ctx context.Context, filePath string, workerID int) (err error) {
 	writeLock, err := filewritelock.GetFileWriteLock(filePath)
 	if err != nil {
 		return fmt.Errorf("sync.processFile: failed to get write lock: %s error: %w", filePath, err)
@@ -261,6 +266,8 @@ func (syncState *syncState) processFile(ctx context.Context, filePath string) (e
 	syncState.foundKeysLock.Unlock()
 
 	if uploadFile {
+		log.Printf("sync.processFile: starting upload of file: %s on worker ID: %d", filePath, workerID)
+
 		file, err := os.Open(filePath)
 		if err != nil {
 			return fmt.Errorf("failed to open file: %s error: %w", filePath, err)
@@ -276,6 +283,8 @@ func (syncState *syncState) processFile(ctx context.Context, filePath string) (e
 		if err != nil {
 			return fmt.Errorf("sync.processFile: failed to put object: %s error: %w", filePath, err)
 		}
+
+		log.Printf("sync.processFile: finished upload of file: %s on worker ID: %d", filePath, workerID)
 	}
 
 	// Only set this after upload is successful. That way an upload failure doesn't leave the file metadata in an inconsistent state.
@@ -286,13 +295,13 @@ func (syncState *syncState) processFile(ctx context.Context, filePath string) (e
 		VaultZeroID:  vaultZeroID,
 	})
 
+	if err != nil {
+		return fmt.Errorf("sync.processFile: failed to set file metadata: %s error: %w", filePath, err)
+	}
+
 	err = os.Chtimes(filePath, currentLastModified, currentLastModified)
 	if err != nil {
 		return fmt.Errorf("sync.processFile: failed to change file times: %s error: %w", filePath, err)
-	}
-
-	if err != nil {
-		return fmt.Errorf("sync.processFile: failed to set file metadata: %s error: %w", filePath, err)
 	}
 
 	if uploadManifest {
