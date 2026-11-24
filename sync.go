@@ -19,6 +19,7 @@ import (
 	vzaws "github.com/jtenhave/vaultzero/aws"
 	"github.com/jtenhave/vaultzero/filemetadata"
 	"github.com/jtenhave/vaultzero/filewritelock"
+	"github.com/jtenhave/vaultzero/synclock"
 )
 
 type syncState struct {
@@ -44,6 +45,12 @@ func Sync(ctx context.Context, rawRootFolder string) (err error) {
 	if err != nil {
 		return fmt.Errorf("sync: failed to get archive file data: %w", err)
 	}
+
+	syncLock, err := synclock.GetSyncLock(archiveFileData.ID)
+	if err != nil {
+		return fmt.Errorf("sync: failed to get sync lock: %w", err)
+	}
+	defer synclock.ReleaseSyncLock(syncLock)
 
 	settingsFileData, err := getSettingsFileData(archiveFileData.ID)
 	if err != nil {
@@ -232,7 +239,11 @@ func (syncState *syncState) processFile(ctx context.Context, filePath string, wo
 	syncState.foundKeysLock.Lock()
 	isNew := fileMetadata == nil
 	if !isNew {
-		_, isNew = syncState.foundKeys[fileMetadata.VaultZeroID]
+		if fileMetadata.ArchiveID != syncState.archiveID {
+			isNew = true
+		} else {
+			_, isNew = syncState.foundKeys[fileMetadata.VaultZeroID]
+		}
 	}
 
 	if isNew {
@@ -298,6 +309,7 @@ func (syncState *syncState) processFile(ctx context.Context, filePath string, wo
 
 	// Only set this after upload is successful. That way an upload failure doesn't leave the file metadata in an inconsistent state.
 	err = syncState.fileMetadataProvider.SetFileMetadata(filePath, filemetadata.FileMetadata{
+		ArchiveID:    syncState.archiveID,
 		VaultPath:    vaultPath,
 		Size:         currentSize,
 		LastModified: currentLastModified,
