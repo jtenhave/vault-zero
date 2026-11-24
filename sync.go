@@ -229,13 +229,26 @@ func (syncState *syncState) processFile(ctx context.Context, filePath string, wo
 	vaultPath := syncState.toVaultPath(filePath)
 	vaultZeroID := ""
 
-	if fileMetadata == nil {
-		uploadFile = true
-		uploadManifest = true
+	syncState.foundKeysLock.Lock()
+	isNew := fileMetadata == nil
+	if !isNew {
+		_, isNew = syncState.foundKeys[fileMetadata.VaultZeroID]
+	}
+
+	if isNew {
 		vaultZeroID = uuid.New().String()
-		log.Printf("sync.processFile: new file: %s", vaultPath)
 	} else {
 		vaultZeroID = fileMetadata.VaultZeroID
+	}
+
+	syncState.foundKeys[vaultZeroID] = true
+	syncState.foundKeysLock.Unlock()
+
+	if isNew {
+		uploadFile = true
+		uploadManifest = true
+		log.Printf("sync.processFile: new file: %s", vaultPath)
+	} else {
 		if fileMetadata.Size != currentSize || fileMetadata.LastModified != currentLastModified {
 			uploadFile = true
 		}
@@ -260,10 +273,6 @@ func (syncState *syncState) processFile(ctx context.Context, filePath string, wo
 			log.Printf("sync.processFile: existing file no changes: %s", vaultPath)
 		}
 	}
-
-	syncState.foundKeysLock.Lock()
-	syncState.foundKeys[vaultZeroID] = true
-	syncState.foundKeysLock.Unlock()
 
 	if uploadFile {
 		log.Printf("sync.processFile: starting upload of file: %s on worker ID: %d", filePath, workerID)
