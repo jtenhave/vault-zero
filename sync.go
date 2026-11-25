@@ -236,14 +236,10 @@ func (syncState *syncState) processFile(ctx context.Context, filePath string, wo
 	vaultPath := syncState.toVaultPath(filePath)
 	vaultZeroID := ""
 
+	isNew := fileMetadata == nil || fileMetadata.ArchiveID != syncState.archiveID
 	syncState.foundKeysLock.Lock()
-	isNew := fileMetadata == nil
 	if !isNew {
-		if fileMetadata.ArchiveID != syncState.archiveID {
-			isNew = true
-		} else {
-			_, isNew = syncState.foundKeys[fileMetadata.VaultZeroID]
-		}
+		_, isNew = syncState.foundKeys[fileMetadata.VaultZeroID]
 	}
 
 	if isNew {
